@@ -99,8 +99,8 @@ data V2Envelope = V2Envelope
       -- description, @x-amz-matdesc, under the key-name @kms_cmk_id@.
     }
 
-newV2 :: (MonadResource m, HasEnv r) => r -> Text -> m Envelope
-newV2 e mkid = do
+newV2 :: MonadResource m => Text -> Env -> m Envelope
+newV2 mkid e = do
     let ctx = Map.singleton "kms_cmk_id" mkid
     rs <- runAWS e . send $
         KMS.generateDataKey mkid
@@ -118,8 +118,8 @@ newV2 e mkid = do
         , _v2Material      = Material ctx
         }
 
-decodeV2 :: (MonadResource m, HasEnv r) => r -> [(CI Text, Text)] -> m Envelope
-decodeV2 e xs = do
+decodeV2 :: MonadResource m => [(CI Text, Text)] -> Env -> m Envelope
+decodeV2 xs e = do
     a   <- xs .& "X-Amz-CEK-Alg"
     w   <- xs .& "X-Amz-Wrap-Alg"
     raw <- xs .& "X-Amz-Key-V2" >>= return   . unBase64
@@ -147,6 +147,9 @@ instance ToJSON Envelope where
         k = toText . CI.foldedCase
         v = String . toText
 
+instance ToBody Envelope where
+    toBody = toBody . toJSON
+
 toMetadata :: Envelope -> [(CI ByteString, ByteString)]
 toMetadata = \case
     V1 _ x -> v1 x
@@ -169,30 +172,31 @@ toMetadata = \case
     b64 :: ByteString -> ByteString
     b64 = toBS . Base64
 
-newEnvelope :: MonadResource m => Env -> Key -> m Envelope
-newEnvelope e = \case
-    Symmetric  c m  -> newV1 (return . ecbEncrypt c) m
-    Asymmetric p m  -> newV1 (rsaEncrypt p) m
-    KMS        mkid -> newV2 e mkid
+newEnvelope :: MonadResource m => Key -> Env -> m Envelope
+newEnvelope k e =
+    case k of
+        Symmetric  c m  -> newV1 (return . ecbEncrypt c) m
+        Asymmetric p m  -> newV1 (rsaEncrypt p) m
+        KMS        mkid -> newV2 mkid e
 
 decodeEnvelope :: MonadResource m
-               => Env
-               -> Key
+               => Key
+               -> Env
                -> [(CI Text, Text)]
                -> m Envelope
-decodeEnvelope e k xs =
+decodeEnvelope k e xs =
     case k of
         Symmetric  c _ -> decodeV1 xs (return . ecbDecrypt c)
         Asymmetric p _ -> decodeV1 xs (rsaDecrypt p)
-        KMS        _   -> decodeV2 e xs
+        KMS        _   -> decodeV2 xs e
 
-fromMetadata :: MonadResource m => Env -> Key -> HashMap Text Text -> m Envelope
-fromMetadata e key = decodeEnvelope e key . map (first CI.mk) . Map.toList
+fromMetadata :: MonadResource m => Key -> Env -> HashMap Text Text -> m Envelope
+fromMetadata key e = decodeEnvelope key e . map (first CI.mk) . Map.toList
 
-fromInstructions :: MonadResource m => Env -> Key -> Object -> m Envelope
-fromInstructions e key o =
+fromInstructions :: MonadResource m => Key -> Env -> Object -> m Envelope
+fromInstructions key e o =
     hoistError (EnvelopeInvalid "Instructions") (parseEither parseJSON (Object o))
-        >>= fromMetadata e key
+        >>= fromMetadata key e
 
 aesKeySize, aesBlockSize :: Int
 aesKeySize   = 32

@@ -36,10 +36,12 @@ import qualified Data.CaseInsensitive         as CI
 import qualified Data.CaseInsensitive         as CI
 import           Data.Conduit
 import qualified Data.HashMap.Strict          as Map
+import           Data.String
 import qualified Data.Text                    as Text
 import           Network.AWS
 import           Network.AWS.KMS              as KMS
 import           Network.AWS.Prelude
+import           Network.AWS.S3               (ObjectKey (..))
 import qualified Network.AWS.S3               as S3
 
 -- | An error thrown when performing encryption or decryption.
@@ -93,11 +95,19 @@ instance FromText WrappingAlgorithm where
 instance ToByteString WrappingAlgorithm where
     toBS KMSWrap = "kms"
 
-data Location = Metadata| Instructions
+data Location = Metadata | Discard
     deriving (Eq)
 
-instructionSuffix :: Text
-instructionSuffix = ".instruction"
+newtype Ext = Ext Text
+    deriving (Eq, Show, IsString)
+
+defaultSuffix :: Ext
+defaultSuffix = ".instruction"
+
+appendSuffix :: Ext -> ObjectKey -> ObjectKey
+appendSuffix (Ext s) o@(ObjectKey k)
+    | s `Text.isSuffixOf` k = o
+    | otherwise             = ObjectKey (k <> s)
 
 newtype Material = Material { material :: HashMap Text Text }
     deriving (Eq, Show, FromJSON, ToJSON)

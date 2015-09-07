@@ -1,8 +1,10 @@
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE RecordWildCards       #-}
 {-# LANGUAGE TupleSections         #-}
 {-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE ViewPatterns          #-}
 
 -- |
 -- Module      : Network.AWS.S3.Encryption.PutObject
@@ -15,161 +17,147 @@
 module Network.AWS.S3.Encryption.PutObject where
 
 import           Control.Arrow
+import           Control.Monad.Catch
 import           Control.Monad.Reader
+import           Control.Monad.Trans.AWS
 import           Control.Monad.Trans.Resource
+import qualified Data.Aeson.Types                   as Aeson
 import           Data.Coerce
 import           Data.Conduit
 import           Data.Proxy
-import           Network.AWS
 import           Network.AWS.Prelude                hiding (coerce)
+import           Network.AWS.Response
 import           Network.AWS.S3
 import qualified Network.AWS.S3                     as S3
 import           Network.AWS.S3.Encryption.Envelope
 import           Network.AWS.S3.Encryption.Types
 import           System.IO
 
+data KeyEnv = KeyEnv
+    { _envInner :: !Env
+    , _envKey   :: !Key
+    }
 
+instance HasEnv KeyEnv where
+    environment = lens _envInner (\s a -> s { _envInner = a })
 
--- metadata:
---   Put:
---     encrypt k (putObject "bkt" "key" body) >>= send
---
---   Get:
---     send (getObject "bkt" "key") >>= decrypt k
---
---   Multipart:
---     e  <- encrypt k (createMultipartUpload "bkt" "key")
---     rs <- send e
---     send $ encryptPart e (uploadPart "foo" bar (rs ^. uploadId))
+class HasKeyEnv a where
+    keyEnvironment :: Lens' a KeyEnv
 
--- instructions:
---   Put:
---     (i, po) <- encryptUsing k (putObject "bkt" "key" body)
---     send po
---     send (i & suffix .~ "foo")
---
---   Get:
---     decryptUsing k
---         <$> send (getInstructions "bkt" "key")
---         <*> send (getObject "bkt" "key")
+    -- | Key material used to encrypt/decrypt requests.
+    envKey :: Lens' a Key
+    envKey = keyEnvironment . lens _envKey (\s a -> s { _envKey = a })
 
--- possible:
---     encrypt k (putObject "bkt" "key")
---     decrypt k (getObject "bkt" "key")
+-- | Set the key material used to encrypt/decrypt a block of actions.
+material :: (MonadReader r m, HasKeyEnv r) => Key -> m a -> m a
+material k = local (envKey .~ k)
 
---     (rs, f) <- initiate k (createMultipartUpload "bkt" "key")
---     send $ f (uploadPart "foo" "bar" (rs ^. uploadId))
+encrypt :: (AWSConstraint r m, HasKeyEnv r)
+        => PutObject
+        -> m PutObjectResponse
+encrypt = encryptUsing >=> send . set location Metadata . fst
 
---     encryptUsing k (Instr ".instruction") (putObject "bkt" "key")
---     decryptUsing k defaultSuffix (getObject "bkt" "key")
+-- encryptWith :: a -> Location -> Envelope -> Encrypted a
 
---     encry
-
--- decrypt :: (MonadResource m, MonadReader r m, HasEnv r, Decrypt a)
---         => Key
---         -> a
---         -> m a
--- decrypt k x = do
---     e' <- view environment
---     e  <- fromMetadata e k (metadata x)
---     return (decryptWith e x)
-
--- class Decrypt a where
---     decryptWith :: Envelope -> a -> a
---     metadata    ::             a -> HashMap Text Text
-
--- instance Decrypt GetObjectResponse where
---     decryptWith e = gorsBody %~ bodyDecrypt e
---     metadata      = view gorsMetadata
-
--- encrypt :: (MonadResource m, MonadReader r m, HasEnv r, Encrypt a)
---         => Key
---         -> a
---         -> m (Encrypted a)
--- encrypt k x = do
---     e <- view environment
---     encryptWith x Metadata <$> newEnvelope e k
-
-encrypt :: Key -> PutObject -> m (Rs PutObject))
-encrypt k x = do
-    e' <- view environment
-    e  <- newEnvelope e k
-    send (encryptWith x Metadata e)
-
-encryptUsing :: Key -> Maybe Text -> PutObject -> m (Rs PutObject, Rs PutObject)
-encryptUsing k l x = do
-    e' <- view environment
-    e  <- newEnvelope e' k
-    let (b, o) = instructions x
-        suf    = fromMaybe instructionSuffix l
-    (,) <$> send (putObject b (o <> suf) (toBody e))
-        <*> send (encryptWith x Instructions e)
-
-decrypt :: Key -> GetObject -> m (Rs GetObject)
-decrypt k x = do
-    e' <- view environment
-    rs <- send x
-    e  <- fromMetadata e' k (rs ^. gorsMetadata)
-    return (rs & gorsBody %~ bodyDecrypt e)
-
-decryptUsing :: Key -> GetObject -> m (Rs GetObject, Rs GetObject)
-decryptUsing = undefined
+encrypted :: (AWSConstraint r m, HasKeyEnv r)
+          => PutObject
+          -> m (Encrypted PutObject, PutInstructions)
+encrypted x = do
+    e <- genEnvelope
+    return ( encryptWith x Discard e
+           , putInstructions x e
+           )
 
 -- | Note about parallelism/concurrency, and encryption of parts. If you don't
 -- encrypt any of the parts then the entire thing is unencrypted!
-initiate :: Key
-         -> CreateMultipartUpload
-         -> m ( Rs CreateMultipartUpload
+initiate :: (AWSConstraint r m, HasKeyEnv r)
+         => CreateMultipartUpload
+         -> m ( CreateMultipartUploadResponse
               , UploadPart -> Encrypted UploadPart
               )
-initiate = undefined
+initiate x = do
+    e  <- genEnvelope
+    rs <- send (encryptWith x Metadata e)
+    return (rs, \y -> encryptWith y Discard e)
 
-initiateUsing :: Key
-              -> CreateMultipartUpload
-              -> m ( Rs PutObject
-                   , Rs CreateMultipartUpload
-                   , UploadPart -> Encrypted UploadPart
-                   )
-initiateUsing = undefined
+initiateInstructions :: (AWSConstraint r m, HasKeyEnv r)
+                     => Ext
+                     -> CreateMultipartUpload
+                     -> m ( CreateMultipartUploadResponse
+                          , UploadPart -> Encrypted UploadPart
+                          )
+initiateInstructions s x = do
+    e  <- genEnvelope
+    rs <- send (encryptWith x Discard e)
+    void $ send (putInstructions x e & piSuffix .~ s)
+    return (rs, \y -> encryptWith y Discard e)
 
-data Encrypted a = Encrypted a [Header] Location Envelope
+decrypt :: (AWSConstraint r m, HasKeyEnv r)
+        => GetObject
+        -> m GetObjectResponse
+decrypt x = do
+    rs <- send x
+    r  <- ask
+    e  <- fromMetadata (r ^. envKey) (r ^. environment) (rs ^. gorsMetadata)
+    return (rs & gorsBody %~ bodyDecrypt e)
+
+decryptUsing :: (AWSConstraint r m, HasKeyEnv r)
+             => Ext
+             -> GetObject
+             -> m GetObjectResponse
+decryptUsing s x = do
+    rs <- send (getInstructions x & giSuffix .~ s)
+    r  <- ask
+    e  <- fromInstructions (r ^. envKey) (r ^. environment) rs
+    send x <&> gorsBody %~ bodyDecrypt e
+
+-- given a request to execute, such as AbortMultipartUpload or DeleteObject,
+-- remove the relevant adjacentinstruction file, if it exists.
+cleanup :: (AWSConstraint r m, AWSRequest a, RemoveInstructions a)
+        => Ext
+        -> a
+        -> m (Rs a)
+cleanup s x = do
+    rs <- send x
+    void $ send (deleteInstructions x & diSuffix .~ s)
+    return rs
+
+genEnvelope :: (AWSConstraint r m, HasKeyEnv r) => m Envelope
+genEnvelope = join $ newEnvelope <$> view envKey <*> view environment
+
+data Encrypted a = Encrypted
+    { _encPayload  :: a
+    , _encHeaders  :: [Header]
+    , _encLocation :: Location
+    , _encEnvelope :: Envelope
+    }
+
+location :: Lens' (Encrypted a) Location
+location = lens _encLocation (\s a -> s { _encLocation = a })
 
 instance AWSRequest a => AWSRequest (Encrypted a) where
     type Rs (Encrypted a) = Rs a
 
-    request (Encrypted x hs l e) = coerce (request x)
-        & rqHeaders <>~ headers
-        & rqBody %~ encrypt
+    request (Encrypted x xs l e) = coerce (request x)
+        & rqBody     %~ f
+        & rqHeaders <>~ hs
       where
-        encrypt b
-            | contentLength b > 0 = bodyEncrypt e b
+        f b | contentLength b > 0 = bodyEncrypt e b
             | otherwise           = b
 
-        headers
-            | l == Metadata = hs <> toHeaders e
-            | otherwise     = hs
+        hs  | l == Metadata = xs <> toHeaders e
+            | otherwise     = xs
 
     response l s (Encrypted x _ _ _) = response l s x
 
-class Instructions a where
-    -- | Determine the bucket and key for the
-    -- instructions file, minus the suffix.
-    instructions :: a -> (BucketName, ObjectKey)
-
-instance Instructions CreateMultipartUpload where
-    instructions = view cmuBucket &&& cmuKey
-
-instance Instructions PutObject where
-    instructions = view poBucket &&& poKey
-
-class Instructions a => Encrypt a where
+class AWSRequest a => ToEncrypted a where
     -- | Create an encryption context.
     encryptWith :: a -> Location -> Envelope -> Encrypted a
 
-instance Encrypt CreateMultipartUpload where
+instance ToEncrypted CreateMultipartUpload where
     encryptWith x = Encrypted x []
 
-instance Encrypt PutObject where
+instance ToEncrypted PutObject where
     encryptWith x = Encrypted x (len : maybeToList md5)
      where
         len = ("X-Amz-Unencrypted-Content-Length",
@@ -178,31 +166,99 @@ instance Encrypt PutObject where
         md5 = ("X-Amz-Unencrypted-Content-MD5",)
             <$> x ^. poBody . to md5Base64
 
--- class EncryptPart a b where
---     encryptPart :: Encrypted a -> b -> Encrypted b
+instance ToEncrypted UploadPart where
+    encryptWith x = Encrypted x (len : maybeToList md5)
+     where
+        len = ("X-Amz-Unencrypted-Content-Length",
+            toBS (contentLength (x ^. upBody)))
 
--- instance EncryptPart CreateMultipartUpload UploadPart where
---     encryptPart (Encrypted _ _ _ e) x = Encrypted x [] Instructions e
+        md5 = ("X-Amz-Unencrypted-Content-MD5",)
+            <$> x ^. upBody . to md5Base64
 
--- decryptUsing :: Decrypt a
---              => Key
---              -> Rs GetInstructions
---              -> a
---              -> m a
+class AddInstructions a where
+    -- | Determine the bucket and key an instructions file is adjacent to.
+    add' :: a -> (BucketName, ObjectKey)
 
+instance AddInstructions (BucketName, ObjectKey) where
+    add' = id
 
--- data PutInstructions = PutInstructions PutObject Text
+instance AddInstructions PutObject where
+    add' = view poBucket &&& view poKey
 
--- putInstructions :: BucketName -> ObjectKey -> Envelope -> PutInstructions
--- putInstructions = undefined
+instance AddInstructions GetObject where
+    add' = view goBucket &&& view goKey
 
--- instance AWSRequest PutInstructions where
---     type Rs PutInstructions = PutObjectResponse
+instance AddInstructions CreateMultipartUpload where
+    add' = view cmuBucket &&& view cmuKey
 
--- data GetInstructions = GetInstructions GetObject Text
+data PutInstructions = PutInstructions
+    { _piExt :: Ext
+    , _piPut :: PutObject
+    } deriving (Show)
 
--- getInstructions :: BucketName -> ObjectKey -> GetInstructions
--- getInstructions = undefined
+putInstructions :: AddInstructions a => a -> Envelope -> PutInstructions
+putInstructions (add' -> (b, k)) =
+    PutInstructions defaultSuffix . putObject b k . toBody
 
--- instance AWSRequest GetInstructions where
---     type Rs GetInstructions = Envelope
+piSuffix :: Lens' PutInstructions Ext
+piSuffix = lens _piExt (\s a -> s { _piExt = a })
+
+instance AWSRequest PutInstructions where
+    type Rs PutInstructions = PutObjectResponse
+
+    request x = coerce . request $
+        _piPut x & poKey %~ appendSuffix (_piExt x)
+
+    response s l (PutInstructions _ x) = response s l x
+
+data GetInstructions = GetInstructions
+    { _giExt :: Ext
+    , _giGet :: GetObject
+    } deriving (Show)
+
+getInstructions :: AddInstructions a => a -> GetInstructions
+getInstructions = GetInstructions defaultSuffix . uncurry getObject . add'
+
+giSuffix :: Lens' GetInstructions Ext
+giSuffix = lens _giExt (\s a -> s { _giExt = a })
+
+instance AWSRequest GetInstructions where
+    type Rs GetInstructions = Aeson.Object
+
+    request x = coerce . request $
+        _giGet x & goKey %~ appendSuffix (_giExt x)
+
+    response  = receiveJSON (\_ _ -> return)
+
+class RemoveInstructions a where
+    -- | Determine the bucket and key an instructions file is adjacent to.
+    remove' :: a -> (BucketName, ObjectKey)
+
+instance RemoveInstructions (BucketName, ObjectKey) where
+    remove' = id
+
+instance RemoveInstructions AbortMultipartUpload where
+    remove' = view amuBucket &&& view amuKey
+
+instance RemoveInstructions DeleteObject where
+    remove' = view doBucket &&& view doKey
+
+data DeleteInstructions = DeleteInstructions
+    { _diExt    :: Ext
+    , _diDelete :: DeleteObject
+    } deriving (Show)
+
+deleteInstructions :: RemoveInstructions a => a -> DeleteInstructions
+deleteInstructions =
+    DeleteInstructions defaultSuffix . uncurry deleteObject . remove'
+
+diSuffix :: Lens' DeleteInstructions Ext
+diSuffix = lens _diExt (\s a -> s { _diExt = a })
+
+instance AWSRequest DeleteInstructions where
+    type Rs DeleteInstructions = DeleteObjectResponse
+
+    request x = coerce . request $
+        _diDelete x & doKey %~ appendSuffix (_diExt x)
+
+    response s l (DeleteInstructions _ x) = response s l x
